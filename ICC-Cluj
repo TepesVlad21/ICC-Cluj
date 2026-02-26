@@ -1,0 +1,315 @@
+import os
+import re
+import pdfplumber
+import pandas as pd
+import xml.etree.ElementTree as ET
+import customtkinter as ctk
+from tkinter import filedialog, messagebox
+import threading
+from datetime import datetime
+
+# --- CONFIGURARE UI ---
+ctk.set_appearance_mode("System")
+ctk.set_default_color_theme("dark-blue")
+
+
+class DataExtractorApp(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self.title("Extractor Decizii - Admin Tools (Cluj)")
+        self.geometry("800x600")
+
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(2, weight=1)
+
+        self.lbl_title = ctk.CTkLabel(
+            self, text="Procesare Dosare (Format: Cluj)", font=("Roboto", 22, "bold")
+        )
+        self.lbl_title.grid(row=0, column=0, pady=20)
+
+        self.btn_select = ctk.CTkButton(
+            self,
+            text="Selectează Fișiere PDF",
+            command=self.start_processing_thread,
+            height=50,
+            font=("Roboto", 16),
+        )
+        self.btn_select.grid(row=1, column=0, pady=10)
+
+        self.textbox = ctk.CTkTextbox(
+            self, width=700, height=350, font=("Consolas", 12)
+        )
+        self.textbox.grid(row=2, column=0, padx=20, pady=10, sticky="nsew")
+
+        self.progress_bar = ctk.CTkProgressBar(self, width=700)
+        self.progress_bar.set(0)
+        self.progress_bar.grid(row=3, column=0, pady=20)
+
+        self.status_label = ctk.CTkLabel(
+            self, text="Așteptare fișiere...", text_color="gray"
+        )
+        self.status_label.grid(row=4, column=0, pady=(0, 20))
+
+    def log(self, message):
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.textbox.insert("end", f"[{timestamp}] {message}\n")
+        self.textbox.see("end")
+
+    def start_processing_thread(self):
+        file_paths = filedialog.askopenfilenames(filetypes=[("PDF Files", "*.pdf")])
+        if file_paths:
+            self.btn_select.configure(state="disabled")
+            threading.Thread(
+                target=self.process_files, args=(file_paths,), daemon=True
+            ).start()
+
+    def process_files(self, file_paths):
+        total_files = len(file_paths)
+        success_count = 0
+
+        for i, file_path in enumerate(file_paths):
+            filename = os.path.basename(file_path)
+            self.status_label.configure(text=f"Procesez: {filename}...")
+            self.progress_bar.set((i) / total_files)
+
+            try:
+                decizii = self.extract_data_from_pdf(file_path)
+
+                if not decizii:
+                    self.log(f"⚠️ {filename}: Nu s-au găsit decizii valide.")
+                else:
+                    self.save_xml(decizii, file_path)
+                    self.save_opis(decizii, file_path)
+                    self.log(f"✅ {filename}: Finalizat ({len(decizii)} decizii).")
+                    success_count += 1
+
+            except Exception as e:
+                self.log(f"❌ {filename}: EROARE - {str(e)}")
+                print(e)
+
+        self.progress_bar.set(1)
+        self.status_label.configure(
+            text=f"Gata! {success_count}/{total_files} fișiere procesate."
+        )
+        self.btn_select.configure(state="normal")
+        messagebox.showinfo("Raport", f"Procesare completă!")
+
+    def extract_data_from_pdf(self, file_path):
+        extracted_data = []
+        base_filename = (
+            os.path.basename(file_path).replace("_OCR.pdf", "").replace(".pdf", "")
+        )
+
+        try:
+            with pdfplumber.open(file_path) as pdf:
+                for page_num, page in enumerate(pdf.pages):
+                    full_text = page.extract_text(layout=True)
+                    if not full_text:
+                        continue
+
+                    # --- FILTRU STRICT DE RECUNOAȘTERE A PAGINII ---
+                    text_upper = full_text.upper()
+
+                    has_institution = (
+                        "MINISTERUL" in text_upper or "AGENTIA" in text_upper
+                    )
+                    has_dest = "DEST:" in text_upper
+                    has_decide = (
+                        "DECIDE:" in text_upper
+                        or "ART.1" in text_upper
+                        or "ART. 1" in text_upper
+                    )
+
+                    if not (has_institution and has_dest and has_decide):
+                        continue
+
+                    # STRATEGIA CROP PENTRU NUME
+                    width = page.width
+                    height = page.height
+
+                    right_header_crop = page.crop(
+                        (width * 0.45, 0, width, height * 0.35)
+                    )
+                    header_text = right_header_crop.extract_text(layout=True) or ""
+
+                    item = self.parse_page_content(
+                        full_text, header_text, base_filename, page_num + 1
+                    )
+                    if item:
+                        extracted_data.append(item)
+
+        except Exception as e:
+            self.log(f"Eroare citire PDF: {str(e)}")
+
+        return extracted_data
+
+    def parse_page_content(self, full_text, header_text, base_filename, page_num):
+        info = {}
+        info["serviciu"] = "SABS-ICC"
+
+        # --- 1. EXTRAGERE NUME ---
+        match_dest = re.search(
+            r"Dest:(.*?)(?=\n|Adresa|Str\.|Jud\.)",
+            header_text,
+            re.IGNORECASE | re.DOTALL,
+        )
+
+        raw_name = ""
+        if match_dest:
+            raw_name = match_dest.group(1)
+        else:
+            match_body = re.search(r"Dest:\s*([A-ZĂÂÎȘȚ\s\-]+)", full_text)
+            raw_name = match_body.group(1) if match_body else "NUME NEIDENTIFICAT"
+
+        clean_name = re.sub(r"[^a-zA-ZĂÂÎȘȚăâîșț\s\-]", " ", raw_name)
+        info["nume"] = " ".join(clean_name.split()).strip()
+
+        # --- 2. Denumire Dosar ---
+        text_upper = full_text.upper()
+        if (
+            "INDEMNIZATIE CRESTERE COPIL" in text_upper
+            or "INDEMNIZATIA PENTRU CRESTEREA COPILULUI" in text_upper
+            or "INDEMNIZATIA LUNARA PENTRU CRESTEREA" in text_upper
+        ):
+            info["denumire_dosar"] = "Indemnizatie Crestere Copil"
+        elif "ALOCATIA DE STAT" in text_upper:
+            info["denumire_dosar"] = "Alocatie de Stat"
+        elif (
+            "STIMULENTUL LUNAR DE INSERTIE" in text_upper
+            or "STIMULENT DE INSERTIE" in text_upper
+        ):
+            info["denumire_dosar"] = "Stimulent Insertie"
+        else:
+            info["denumire_dosar"] = "Beneficiu Nespecificat"
+
+        # --- 3. Judet ---
+        info["judet"] = "Cluj"
+
+        # --- 4. Data Acordare & An Dosar ---
+        match_data = re.search(
+            r"incepand\s+cu\s+data\s+de\s+(\d{2}[\./\-]\d{2}[\./\-]\d{4})", full_text
+        )
+        if match_data:
+            full_date = match_data.group(1)
+            info["data_acordare"] = full_date
+            info["an_dosar"] = (
+                full_date.replace(".", "/").replace("-", "/").split("/")[-1]
+            )
+        else:
+            info["data_acordare"] = "-"
+            info["an_dosar"] = "2020"
+
+        # --- 5. CNP ---
+        match_cnp = re.search(r"CNP\s+(\d{13})", full_text)
+        info["cnp"] = match_cnp.group(1) if match_cnp else "0000000000000"
+
+        # --- 6. Unitate Arhivistica ---
+        info["unitate_arhivistica"] = base_filename
+
+        # --- 7. Extragere Număr și Dată Decizie (DOAR Pentru OPIS) ---
+        # Eliminăm decizia directorului (232/2017) ca să nu o ia din greșeală
+        text_curatat = re.sub(
+            r"DECIZI[A-Z]*\s+NR\.?\s*232[/\-]\d{2}[\./\-]\d{4}",
+            "",
+            full_text,
+            flags=re.IGNORECASE,
+        )
+        text_curatat = re.sub(
+            r"numit\s+prin\s+DECIZI[A-Z]*\s+NR\.?\s*\d+[/\-]\d{2}[\./\-]\d{4}",
+            "",
+            text_curatat,
+            flags=re.IGNORECASE,
+        )
+
+        # Permitem ignorarea virgulei sau a punctului dintre numar si data folosind [\s,\.]*
+        match_decizie = re.search(
+            r"DECIZI[A-Z]*\s+nr\.?\s*([A-Z0-9]+)[\s,\.]*din\s*(?:data\s+de\s+)?(\d{2}[\./\-]\d{2}[\./\-]\d{4})",
+            text_curatat,
+            re.IGNORECASE,
+        )
+
+        if match_decizie:
+            info["nr_decizie"] = match_decizie.group(1)
+            info["data_decizie"] = match_decizie.group(2)
+        else:
+            # Fallback in caz ca OCR-ul a sarit peste cuvantul DECIZIA
+            match_fallback = re.search(
+                r"nr\.?\s*([0-9]{4,})[\s,\.]*din\s*(\d{2}[\./\-]\d{2}[\./\-]\d{4})",
+                text_curatat,
+                re.IGNORECASE,
+            )
+            if match_fallback:
+                info["nr_decizie"] = match_fallback.group(1)
+                info["data_decizie"] = match_fallback.group(2)
+            else:
+                info["nr_decizie"] = "-"
+                info["data_decizie"] = "-"
+
+        # --- 8. Extragere Cod Arhivă Dosar (DOAR pentru XML <NrDosar>) ---
+        match_arhiva = re.search(
+            r"Cod\s+arhiva\s+dosar:\s*([^\n]+)", full_text, re.IGNORECASE
+        )
+        if match_arhiva:
+            info["nr_dosar"] = match_arhiva.group(1).strip()
+        else:
+            info["nr_dosar"] = "-"
+
+        info["pagina"] = page_num
+        return info
+
+    def save_xml(self, data_list, original_path):
+        root = ET.Element("Indexare")
+        for item in data_list:
+            doc = ET.SubElement(root, "Decizie")
+            ET.SubElement(doc, "Serviciu").text = str(item.get("serviciu", ""))
+            ET.SubElement(doc, "DenumireDosar").text = str(
+                item.get("denumire_dosar", "")
+            )
+            ET.SubElement(doc, "Judet").text = str(item.get("judet", "Cluj"))
+
+            ET.SubElement(doc, "NrDosar").text = str(item.get("nr_dosar", ""))
+
+            ET.SubElement(doc, "AnDosar").text = str(item.get("an_dosar", ""))
+            ET.SubElement(doc, "CNP").text = str(item.get("cnp", ""))
+            ET.SubElement(doc, "Nume").text = str(item.get("nume", ""))
+            ET.SubElement(doc, "UnitateArhivistica").text = str(
+                item.get("unitate_arhivistica", "")
+            )
+
+        tree = ET.ElementTree(root)
+        output_xml = original_path.replace("_OCR.pdf", ".xml").replace(".pdf", ".xml")
+        try:
+            ET.indent(tree, space="\t", level=0)
+        except AttributeError:
+            pass
+        tree.write(output_xml, encoding="utf-8", xml_declaration=True)
+
+    def save_opis(self, data_list, original_path):
+        opis_rows = []
+        for i, item in enumerate(data_list):
+            desc = f"Decizia nr. {item.get('nr_decizie', '?')} din data {item.get('data_decizie', '?')} pentru beneficiarul {item.get('nume', '')}"
+            opis_rows.append(
+                {
+                    "Nr Curent": i + 1,
+                    "Descriere Document": desc,
+                    "Pagina": item.get("pagina", 0),
+                }
+            )
+        df = pd.DataFrame(opis_rows)
+        output_excel = original_path.replace("_OCR.pdf", "_OPIS.xlsx").replace(
+            ".pdf", "_OPIS.xlsx"
+        )
+        try:
+            with pd.ExcelWriter(output_excel, engine="openpyxl") as writer:
+                df.to_excel(writer, index=False, sheet_name="OPIS")
+                ws = writer.sheets["OPIS"]
+                ws.column_dimensions["A"].width = 10
+                ws.column_dimensions["B"].width = 80
+                ws.column_dimensions["C"].width = 10
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    app = DataExtractorApp()
+    app.mainloop()
