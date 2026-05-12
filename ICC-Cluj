@@ -16,14 +16,14 @@ ctk.set_default_color_theme("dark-blue")
 class DataExtractorApp(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("Extractor Decizii - Admin Tools (Cluj)")
+        self.title("Extractor Decizii - Admin Tools (Cluj + DL118)")
         self.geometry("800x600")
 
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(2, weight=1)
 
         self.lbl_title = ctk.CTkLabel(
-            self, text="Procesare Dosare (Format: Cluj)", font=("Roboto", 22, "bold")
+            self, text="Procesare Dosare (Format: Cluj & Decrete)", font=("Roboto", 22, "bold")
         )
         self.lbl_title.grid(row=0, column=0, pady=20)
 
@@ -107,42 +107,99 @@ class DataExtractorApp(ctk.CTk):
                     if not full_text:
                         continue
 
-                    # --- FILTRU STRICT DE RECUNOAȘTERE A PAGINII ---
                     text_upper = full_text.upper()
 
-                    has_institution = (
-                        "MINISTERUL" in text_upper or "AGENTIA" in text_upper
-                    )
+                    # 1. VERIFICARE PENTRU DECRETE LEGE (Ramura Nouă)
+                    is_dl_118 = "118/1990" in text_upper
+
+                    # 2. VERIFICARE PENTRU ICC ORIGINAL (Ramura Ta Veche)
+                    has_institution = "MINISTERUL" in text_upper or "AGENTIA" in text_upper
                     has_dest = "DEST:" in text_upper
-                    has_decide = (
-                        "DECIDE:" in text_upper
-                        or "ART.1" in text_upper
-                        or "ART. 1" in text_upper
-                    )
+                    has_decide = "DECIDE:" in text_upper or "ART.1" in text_upper or "ART. 1" in text_upper
 
-                    if not (has_institution and has_dest and has_decide):
-                        continue
-
-                    # STRATEGIA CROP PENTRU NUME
+                    # Extragem mereu header-ul cu crop (ne trebuie la ambele)
                     width = page.width
                     height = page.height
-
-                    right_header_crop = page.crop(
-                        (width * 0.45, 0, width, height * 0.35)
-                    )
+                    right_header_crop = page.crop((width * 0.45, 0, width, height * 0.35))
                     header_text = right_header_crop.extract_text(layout=True) or ""
 
-                    item = self.parse_page_content(
-                        full_text, header_text, base_filename, page_num + 1
-                    )
-                    if item:
-                        extracted_data.append(item)
+                    # RUTA 1: DECRETE LEGE
+                    if is_dl_118:
+                        item = self.parse_dl_118_cluj(full_text, header_text, base_filename, page_num + 1)
+                        if item:
+                            extracted_data.append(item)
+                    
+                    # RUTA 2: LOGICA ORIGINALĂ (A rămas neschimbată)
+                    elif has_institution and has_dest and has_decide:
+                        item = self.parse_page_content(full_text, header_text, base_filename, page_num + 1)
+                        if item:
+                            extracted_data.append(item)
 
         except Exception as e:
             self.log(f"Eroare citire PDF: {str(e)}")
 
         return extracted_data
 
+    # =========================================================
+    # LOGICA NOUĂ ADAUGATĂ EXCLUSIV PENTRU DECRETE CLUJ
+    # =========================================================
+    def parse_dl_118_cluj(self, full_text, header_text, base_filename, page_num):
+        info = {}
+        info["serviciu"] = "SABS-ICC" # Pastrat asa ca sa nu iti dea peste cap restul structurilor
+        info["judet"] = "Cluj"
+        info["denumire_dosar"] = "DL 118/1990"
+
+        # 1. Extragere Nume (Verificam intai daca exista un Dest: clasic, apoi cautam in text)
+        raw_name = "NUME NEIDENTIFICAT"
+        match_dest = re.search(r"Dest:(.*?)(?=\n|Adresa|Str\.|Jud\.)", header_text, re.IGNORECASE | re.DOTALL)
+        
+        if match_dest and len(match_dest.group(1).strip()) > 2:
+            raw_name = match_dest.group(1)
+        else:
+            # Cauta formulari de genul: "privind pe domnul SZOLGA DOMINIC CNP..." sau "d-na MILE ELENA, CNP..."
+            match_titular = re.search(r"(?:privind pe domnul|d-na)\s+([A-ZĂÂÎȘȚ\s\-]+?)\s*(?:CNP|,)", full_text, re.IGNORECASE)
+            if match_titular:
+                raw_name = match_titular.group(1)
+            else:
+                # Cauta formulari de genul: "Cererea d-lui/d-nei DEMETER ESZTER..." sau "Cererea doamnei CRIȘAN..."
+                match_cerere = re.search(r"Cererea\s+(?:d-lui/d-nei|doamnei|domnului|d-nei|d-na)\s+([A-ZĂÂÎȘȚa-zăâîșț\s\-]+?),?\s*(?:domiciliat|av[âa]nd)", full_text, re.IGNORECASE)
+                if match_cerere:
+                    raw_name = match_cerere.group(1)
+
+        info["nume"] = " ".join(re.sub(r"[^a-zA-ZĂÂÎȘȚăâîșț\s\-]", " ", raw_name).split()).strip()
+
+        # 2. Extragere Decizie și Dată (Capacitate de a citi si nr. cu litere, ex: 2/Î/)
+        match_decizie = re.search(r"Decizi[a-z]*\s*nr\.?\s*([0-9A-Z/Î\.\-]+)\s*(?:din|/)\s*(\d{2}[\./\-]\d{2}[\./\-]\d{4})", full_text, re.IGNORECASE)
+        if match_decizie:
+            info["nr_decizie"] = match_decizie.group(1).strip(" /")
+            info["data_decizie"] = match_decizie.group(2).strip()
+            info["data_acordare"] = info["data_decizie"]
+            info["an_dosar"] = info["data_decizie"][-4:]
+        else:
+            info["nr_decizie"] = "-"
+            info["data_decizie"] = "-"
+            info["data_acordare"] = "-"
+            info["an_dosar"] = "2020" # Fallback
+
+        # 3. Dosar (Decretele Cluj nu prea au nr de dosar vizibil clar, folosim decizia ca in Mures)
+        info["nr_dosar"] = info["nr_decizie"]
+
+        # 4. CNP
+        match_cnp = re.search(r"(?:CNP|C\.N\.P\.?)\s*[:\-]?\s*([0-9]{13})", full_text, re.IGNORECASE)
+        if match_cnp:
+            info["cnp"] = match_cnp.group(1)
+        else:
+            match_fb = re.search(r"\b([1256]\d{12})\b", full_text)
+            info["cnp"] = match_fb.group(1) if match_fb else "0000000000000"
+
+        info["unitate_arhivistica"] = base_filename
+        info["pagina"] = page_num
+
+        return info
+
+    # =========================================================
+    # LOGICA TA ORIGINALĂ PENTRU CLUJ (COMPLET NESCHIMBATĂ)
+    # =========================================================
     def parse_page_content(self, full_text, header_text, base_filename, page_num):
         info = {}
         info["serviciu"] = "SABS-ICC"
